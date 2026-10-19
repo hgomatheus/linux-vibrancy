@@ -6,5 +6,4 @@ dist/
 # makepkg output
 /src/
 /pkg/
-/linux-vibrancy/
 *.pkg.tar.*

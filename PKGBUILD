@@ -1,4 +1,6 @@
 # Maintainer: hgomatheus
+#
+# Builds the checkout this file lives in: run `makepkg -si` from the repository root.
 pkgname=linux-vibrancy-git
 _pkgname=linux-vibrancy
 pkgver=0.1.0
@@ -14,26 +16,24 @@ optdepends=('nvidia-settings: X11 backend for NVIDIA cards'
             'xorg-xrandr: X11 backend for AMD and Intel cards')
 provides=("$_pkgname")
 conflicts=("$_pkgname")
-source=("git+$url.git")
-sha256sums=('SKIP')
 
 pkgver() {
-  cd "$_pkgname"
+  cd "$startdir"
   printf "0.1.0.r%s.g%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
 }
 
 build() {
-  cd "$_pkgname"
-  python -m build --wheel --no-isolation
+  cd "$startdir"
+  python -m build --wheel --no-isolation --outdir "$srcdir/dist"
 }
 
 check() {
-  cd "$_pkgname"
-  PYTHONPATH="$PWD" python -m pytest -q
+  cd "$startdir"
+  PYTHONPATH="$startdir" python -m pytest -q -p no:cacheprovider
 }
 
 package() {
-  cd "$_pkgname"
-  python -m installer --destdir="$pkgdir" dist/*.whl
+  cd "$startdir"
+  python -m installer --destdir="$pkgdir" "$srcdir"/dist/*.whl
   install -Dm644 data/linux-vibrancy.desktop "$pkgdir/usr/share/applications/linux-vibrancy.desktop"
 }
