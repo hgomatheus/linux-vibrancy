@@ -1,0 +1,308 @@
+"""Colour math shared by every backend.
+
+Vibrance is expressed the same way as in the NVIDIA Control Panel: a level
+from 0 to 100 where 50 means "unchanged". Every backend converts that level
+into a saturation factor and applies a luminance-preserving saturation
+matrix
+
+    Sat(s) = s * I + (1 - s) * 1 * w^T
+
+where w are the Rec.709 / sRGB luma weights. Grey stays grey, white stays
+white and only the distance from grey is scaled, which is what NVIDIA's
+"Digital Vibrance" does.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import struct
+import time
+
+DEFAULT_LEVEL = 50
+MIN_LEVEL = 0
+MAX_LEVEL = 100
+
+# sRGB / BT.709 primaries and D65 white point (CIE 1931 xy).
+SRGB_PRIMARIES = ((0.640, 0.330), (0.300, 0.600), (0.150, 0.060))
+D65_XY = (0.3127, 0.3290)
+# ICC profile connection space illuminant, exactly as the spec defines it.
+D50_PCS = (0.9642, 1.0, 0.8249)
+
+BRADFORD = (
+    (0.8951, 0.2664, -0.1614),
+    (-0.7502, 1.7135, 0.0367),
+    (0.0389, -0.0685, 1.0296),
+)
+
+Matrix = tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]
+Vector = tuple[float, float, float]
+
+
+def clamp_level(level: float) -> int:
+    return int(round(max(MIN_LEVEL, min(MAX_LEVEL, level))))
+
+
+def level_to_saturation(level: float) -> float:
+    """0 -> greyscale, 50 -> unchanged, 100 -> twice the saturation."""
+    return clamp_level(level) / 50.0
+
+
+def level_to_nvidia(level: float) -> int:
+    """Map a 0-100 level onto NVIDIA's DigitalVibrance attribute (-1024..1023).
+
+    On Windows the control panel shows 50% for the attribute value 0, so this
+    is the exact same scale people are used to from there.
+    """
+    value = round((clamp_level(level) - 50) * 1024 / 50)
+    return max(-1024, min(1023, value))
+
+
+def nvidia_to_level(value: int) -> int:
+    return clamp_level(50 + value * 50 / 1024)
+
+
+# --- small 3x3 helpers (no numpy on a stock install) -------------------------
+
+def mat_mul(a: Matrix, b: Matrix) -> Matrix:
+    return tuple(
+        tuple(sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3))
+        for i in range(3)
+    )  # type: ignore[return-value]
+
+
+def mat_vec(m: Matrix, v: Vector) -> Vector:
+    return tuple(sum(m[i][k] * v[k] for k in range(3)) for i in range(3))  # type: ignore[return-value]
+
+
+def mat_inv(m: Matrix) -> Matrix:
+    (a, b, c), (d, e, f), (g, h, i) = m
+    det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+    if abs(det) < 1e-12:
+        raise ValueError("matrix is not invertible")
+    return (
+        ((e * i - f * h) / det, (c * h - b * i) / det, (b * f - c * e) / det),
+        ((f * g - d * i) / det, (a * i - c * g) / det, (c * d - a * f) / det),
+        ((d * h - e * g) / det, (b * g - a * h) / det, (a * e - b * d) / det),
+    )
+
+
+def xy_to_xyz(x: float, y: float) -> Vector:
+    return (x / y, 1.0, (1.0 - x - y) / y)
+
+
+def rgb_to_xyz_matrix(primaries=SRGB_PRIMARIES, white=D65_XY) -> Matrix:
+    """Linear RGB -> XYZ matrix for the given primaries, normalised to Y(white) = 1."""
+    cols = [xy_to_xyz(*p) for p in primaries]
+    p = tuple(tuple(cols[j][i] for j in range(3)) for i in range(3))
+    scale = mat_vec(mat_inv(p), xy_to_xyz(*white))  # type: ignore[arg-type]
+    return tuple(tuple(p[i][j] * scale[j] for j in range(3)) for i in range(3))  # type: ignore[return-value]
+
+
+SRGB_TO_XYZ = rgb_to_xyz_matrix()
+LUMA = SRGB_TO_XYZ[1]  # (0.2126, 0.7152, 0.0722)
+
+
+def saturation_matrix(s: float, luma: Vector = LUMA) -> Matrix:
+    return tuple(
+        tuple((1.0 - s) * luma[j] + (s if i == j else 0.0) for j in range(3))
+        for i in range(3)
+    )  # type: ignore[return-value]
+
+
+def bradford_adaptation(src: Vector, dst: Vector) -> Matrix:
+    """Chromatic adaptation matrix from white point src to dst (both XYZ)."""
+    cs = mat_vec(BRADFORD, src)
+    cd = mat_vec(BRADFORD, dst)
+    scale = (
+        (cd[0] / cs[0], 0.0, 0.0),
+        (0.0, cd[1] / cs[1], 0.0),
+        (0.0, 0.0, cd[2] / cs[2]),
+    )
+    return mat_mul(mat_inv(BRADFORD), mat_mul(scale, BRADFORD))
+
+
+# --- X11 / DRM colour transformation matrix ----------------------------------
+
+def ctm_property_values(m: Matrix) -> list[int]:
+    """Encode a matrix for the RandR "CTM" output property.
+
+    The kernel wants nine S31.32 sign-magnitude numbers; the X property
+    carries each of them as two 32-bit words, low word first.
+    """
+    out: list[int] = []
+    for row in m:
+        for v in row:
+            mag = int(round(abs(v) * (1 << 32)))
+            if v < 0:
+                mag |= 1 << 63
+            for word in (mag & 0xFFFFFFFF, mag >> 32):
+                out.append(word - (1 << 32) if word >= 1 << 31 else word)
+    return out
+
+
+# --- Hyprland screen shader --------------------------------------------------
+
+def hyprland_shader(level: float) -> str:
+    s = level_to_saturation(level)
+    lr, lg, lb = LUMA
+    return f"""#version 300 es
+// Generated by linux-vibrancy: digital vibrance {clamp_level(level)}% (saturation x{s:.2f}).
+// Re-run `vibrance set <level>` instead of editing this file.
+
+precision highp float;
+in vec2 v_texcoord;
+layout(location = 0) out vec4 fragColor;
+uniform sampler2D tex;
+
+const vec3 LUMA = vec3({lr:.6f}, {lg:.6f}, {lb:.6f});
+const float SATURATION = {s:.6f};
+
+void main() {{
+    vec4 color = texture(tex, v_texcoord);
+    vec3 grey = vec3(dot(color.rgb, LUMA));
+    fragColor = vec4(clamp(mix(grey, color.rgb, SATURATION), 0.0, 1.0), color.a);
+}}
+"""
+
+
+# --- ICC profile for KWin ----------------------------------------------------
+#
+# KWin colour-manages sRGB content into whatever gamut the output's ICC
+# profile describes: out = inverse(P_profile) * P_srgb * rgb, then clips.
+# Declaring primaries pulled towards white by 1/s therefore makes KWin
+# push every colour away from grey by s. Writing P_profile = P_srgb * Sat(1/s)
+# gives exactly out = Sat(s) * rgb, with white and luminance untouched.
+
+GAMMA = 2.2  # KWin encodes SDR outputs with a pure 2.2 power curve.
+
+
+def profile_primaries(level: float) -> Matrix:
+    """RGB -> XYZ (D65) matrix the vibrance ICC profile declares."""
+    s = level_to_saturation(level)
+    if s <= 0:
+        raise ValueError("level 0 cannot be expressed as an ICC profile")
+    return mat_mul(SRGB_TO_XYZ, saturation_matrix(1.0 / s))
+
+
+def xyz_to_xy(v: Vector) -> tuple[float, float]:
+    total = sum(v)
+    return (v[0] / total, v[1] / total)
+
+
+def _triangle_area(a, b, c) -> float:
+    return abs(0.5 * (a[0] * (b[1] - c[1]) + b[0] * (c[1] - a[1]) + c[0] * (a[1] - b[1])))
+
+
+def kwin_accepts(level: float) -> bool:
+    """Mirror of KWin's Colorimetry::isValid() check for the declared primaries."""
+    try:
+        m = profile_primaries(level)
+    except ValueError:
+        return False
+    cols = [tuple(m[i][j] for i in range(3)) for j in range(3)]
+    if any(sum(c) <= 0 or c[1] <= 0 for c in cols):
+        return False
+    r, g, b = (xyz_to_xy(c) for c in cols)  # type: ignore[arg-type]
+    white = D65_XY
+    area = _triangle_area(r, g, b)
+    if area < 0.02:
+        return False
+    parts = _triangle_area(white, g, b) + _triangle_area(r, white, b) + _triangle_area(r, g, white)
+    return abs(parts - area) <= 0.001
+
+
+def min_icc_level() -> int:
+    return next(level for level in range(MIN_LEVEL, MAX_LEVEL + 1) if kwin_accepts(level))
+
+
+def _s15f16(v: float) -> bytes:
+    return struct.pack(">i", int(round(v * 65536)))
+
+
+def _xyz_tag(v: Vector) -> bytes:
+    return b"XYZ " + b"\0" * 4 + b"".join(_s15f16(c) for c in v)
+
+
+def _sf32_tag(m: Matrix) -> bytes:
+    return b"sf32" + b"\0" * 4 + b"".join(_s15f16(c) for row in m for c in row)
+
+
+def _para_gamma_tag(gamma: float) -> bytes:
+    return b"para" + b"\0" * 4 + struct.pack(">HH", 0, 0) + _s15f16(gamma)
+
+
+def _mluc_tag(text: str) -> bytes:
+    data = text.encode("utf-16-be")
+    return b"mluc" + b"\0" * 4 + struct.pack(">II", 1, 12) + b"enUS" + struct.pack(">II", len(data), 28) + data
+
+
+def _pad4(b: bytes) -> bytes:
+    return b + b"\0" * (-len(b) % 4)
+
+
+def build_icc_profile(level: float) -> bytes:
+    """ICC v4.3 matrix/TRC display profile that makes KWin apply vibrance."""
+    level = clamp_level(level)
+    if not kwin_accepts(level):
+        raise ValueError(f"level {level} is below what KWin accepts (minimum {min_icc_level()})")
+
+    white_d65 = xy_to_xyz(*D65_XY)
+    chad = bradford_adaptation(white_d65, D50_PCS)
+    primaries = mat_mul(chad, profile_primaries(level))
+    colorants = [tuple(primaries[i][j] for i in range(3)) for j in range(3)]
+
+    trc = _para_gamma_tag(GAMMA)
+    tags: list[tuple[bytes, bytes]] = [
+        (b"desc", _mluc_tag(f"linux-vibrancy {level}%")),
+        (b"cprt", _mluc_tag("No copyright, use freely")),
+        (b"wtpt", _xyz_tag(D50_PCS)),
+        (b"chad", _sf32_tag(chad)),
+        (b"rXYZ", _xyz_tag(colorants[0])),  # type: ignore[arg-type]
+        (b"gXYZ", _xyz_tag(colorants[1])),  # type: ignore[arg-type]
+        (b"bXYZ", _xyz_tag(colorants[2])),  # type: ignore[arg-type]
+        (b"rTRC", trc),
+        (b"gTRC", trc),
+        (b"bTRC", trc),
+    ]
+
+    header_size = 128
+    table_size = 4 + 12 * len(tags)
+    offset = header_size + table_size
+    table = struct.pack(">I", len(tags))
+    body = b""
+    shared: dict[bytes, int] = {}
+    for sig, data in tags:
+        if data not in shared:  # the three TRC tags share one copy
+            shared[data] = offset + len(body)
+            body += _pad4(data)
+        table += sig + struct.pack(">II", shared[data], len(data))
+
+    size = header_size + len(table) + len(body)
+    epoch = time.gmtime(0)  # fixed date keeps profiles byte-for-byte reproducible
+    header = (
+        struct.pack(">I", size)
+        + b"\0\0\0\0"                      # preferred CMM
+        + bytes((4, 0x30, 0, 0))           # version 4.3
+        + b"mntr" + b"RGB " + b"XYZ "
+        + struct.pack(">6H", epoch.tm_year, epoch.tm_mon, epoch.tm_mday, 0, 0, 0)
+        + b"acsp"
+        + b"\0\0\0\0"                      # primary platform
+        + struct.pack(">I", 0)             # flags
+        + b"\0\0\0\0" + b"\0\0\0\0"        # device manufacturer / model
+        + struct.pack(">Q", 0)             # device attributes
+        + struct.pack(">I", 0)             # rendering intent: perceptual
+        + b"".join(_s15f16(c) for c in D50_PCS)
+        + b"lnvb"                          # creator
+        + b"\0" * 16                       # profile ID, filled in below
+        + b"\0" * 28
+    )
+    assert len(header) == header_size
+    profile = bytearray(header + table + body)
+
+    # Profile ID: MD5 over the profile with flags, intent and ID zeroed.
+    digest_input = bytearray(profile)
+    digest_input[44:48] = b"\0" * 4
+    digest_input[64:68] = b"\0" * 4
+    digest_input[84:100] = b"\0" * 16
+    profile[84:100] = hashlib.md5(digest_input).digest()
+    return bytes(profile)

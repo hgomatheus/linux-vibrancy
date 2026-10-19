@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "linux-vibrancy"
+dynamic = ["version"]
+description = "NVIDIA-style digital vibrance (colour saturation) control for Linux desktops"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+gui = ["PyQt6"]
+
+[project.scripts]
+vibrance = "vibrance.cli:main"
+
+[tool.setuptools]
+packages = ["vibrance"]
+
+[tool.setuptools.dynamic]
+version = { attr = "vibrance.__version__" }

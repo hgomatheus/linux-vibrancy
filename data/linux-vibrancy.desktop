@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Digital Vibrance
+GenericName=Colour Saturation
+Comment=Make screen colours more vivid, like NVIDIA's Digital Vibrance
+Exec=vibrance gui
+Icon=preferences-desktop-color
+Terminal=false
+Categories=Settings;HardwareSettings;Qt;
+Keywords=vibrance;saturation;color;colour;nvidia;monitor;display;washed out;
