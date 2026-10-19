@@ -29,7 +29,7 @@ build() {
 
 check() {
   cd "$startdir"
-  PYTHONPATH="$startdir" python -m pytest -q -p no:cacheprovider
+  PYTHONPATH="$startdir" python -m pytest -q -p no:cacheprovider tests
 }
 
 package() {

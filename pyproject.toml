@@ -20,3 +20,7 @@ packages = ["vibrance"]
 
 [tool.setuptools.dynamic]
 version = { attr = "vibrance.__version__" }
+
+[tool.pytest.ini_options]
+# makepkg puts src/ and pkg/ (not readable mid-build) next to the sources.
+testpaths = ["tests"]
