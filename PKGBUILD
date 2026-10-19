@@ -1,8 +1,9 @@
 # Maintainer: hgomatheus
 #
 # Builds the checkout this file lives in: run `makepkg -si` from the repository root.
-pkgname=linux-vibrancy-git
-_pkgname=linux-vibrancy
+# The version is fixed here (no pkgver()) so makepkg never edits this tracked file
+# and `git pull` keeps working.
+pkgname=linux-vibrancy
 pkgver=0.1.0
 pkgrel=1
 pkgdesc="NVIDIA-style digital vibrance (colour saturation) slider for KDE Plasma, Hyprland and X11"
@@ -10,17 +11,10 @@ arch=('any')
 url="https://github.com/hgomatheus/linux-vibrancy"
 license=('unknown')
 depends=('python' 'python-pyqt6')
-makedepends=('git' 'python-build' 'python-installer' 'python-setuptools' 'python-wheel')
+makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
 checkdepends=('python-pytest')
 optdepends=('nvidia-settings: X11 backend for NVIDIA cards'
             'xorg-xrandr: X11 backend for AMD and Intel cards')
-provides=("$_pkgname")
-conflicts=("$_pkgname")
-
-pkgver() {
-  cd "$startdir"
-  printf "0.1.0.r%s.g%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
-}
 
 build() {
   cd "$startdir"

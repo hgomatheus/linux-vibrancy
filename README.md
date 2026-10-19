@@ -106,7 +106,7 @@ They should feel very close.
 ```sh
 vibrance reset
 vibrance autostart off
-sudo pacman -R linux-vibrancy-git
+sudo pacman -R linux-vibrancy
 rm -r ~/.config/linux-vibrancy ~/.local/share/linux-vibrancy
 ```
 
